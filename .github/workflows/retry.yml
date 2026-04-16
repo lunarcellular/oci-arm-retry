@@ -1,0 +1,97 @@
+name: Retry ARM VM Creation
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/30 * * * *'
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup OCI config
+        run: |
+          mkdir -p ~/.oci
+          echo "${{ secrets.OCI_PRIVATE_KEY }}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_USER_ID }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY_ID }}
+          region=${{ secrets.OCI_REGION }}
+          key_file=~/.oci/oci_api_key.pem
+          EOF
+          chmod 600 ~/.oci/config
+
+      - name: Install OCI CLI
+        run: |
+          bash -c "$(curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh)" -- --accept-all-defaults --install-dir ~/oci-cli
+          echo "$HOME/oci-cli/bin" >> $GITHUB_PATH
+
+      - name: Get latest Ubuntu 22.04 ARM image
+        id: get-image
+        run: |
+          IMAGE_ID=$(~/oci-cli/bin/oci compute image list \
+            --compartment-id "${{ secrets.OCI_COMPARTMENT_ID }}" \
+            --operating-system "Canonical Ubuntu" \
+            --operating-system-version "22.04" \
+            --shape "VM.Standard.A1.Flex" \
+            --sort-by TIMECREATED \
+            --sort-order DESC \
+            --query "data[0].id" \
+            --raw-output)
+          echo "image_id=$IMAGE_ID" >> $GITHUB_OUTPUT
+          echo "Image: $IMAGE_ID"
+
+      - name: Attempt VM creation
+        id: create
+        continue-on-error: true
+        run: |
+          ~/oci-cli/bin/oci compute instance launch \
+            --availability-domain "${{ secrets.OCI_AD }}" \
+            --compartment-id "${{ secrets.OCI_COMPARTMENT_ID }}" \
+            --shape VM.Standard.A1.Flex \
+            --shape-config '{"ocpus": 4, "memoryInGBs": 24}' \
+            --image-id "${{ steps.get-image.outputs.image_id }}" \
+            --subnet-id "${{ secrets.OCI_SUBNET_ID }}" \
+            --display-name "content-pipeline-arm" \
+            --ssh-authorized-keys-file /dev/stdin <<< "${{ secrets.OCI_SSH_PUBLIC_KEY }}" \
+            --assign-public-ip true \
+            --wait-for-state RUNNING 2>&1 | tee result.log
+          if grep -q "lifecycleState.*RUNNING" result.log; then
+            echo "status=success" >> $GITHUB_OUTPUT
+          elif grep -qi "out of.*capacity\|InternalError\|500\|429" result.log; then
+            echo "status=capacity" >> $GITHUB_OUTPUT
+          else
+            echo "status=error" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send success email
+        if: steps.create.outputs.status == 'success'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.GMAIL_USER }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          subject: "🎉 ARM VM Created!"
+          to: ${{ secrets.NOTIFICATION_EMAIL }}
+          from: OCI Bot <${{ secrets.GMAIL_USER }}>
+          html_body: |
+            <h2>🎉 Oracle Cloud ARM VM is ready!</h2>
+            <p>Your ARM VM (4 OCPU / 24 GB RAM) was successfully created.</p>
+            <p>Log into Oracle Cloud to see it. The auto-retry will now stop — you can disable this workflow.</p>
+
+      - name: Disable workflow on success
+        if: steps.create.outputs.status == 'success'
+        run: |
+          curl -X PUT \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/retry.yml/disable"
+
+      - name: Log capacity status
+        if: steps.create.outputs.status == 'capacity'
+        run: echo "Still no ARM capacity. Will retry in 30 min."
