@@ -83,7 +83,7 @@ jobs:
           if [ "$EXIT_CODE" = "0" ]; then
             # OCI CLI exit 0 with --wait-for-state RUNNING means VM actually reached RUNNING
             echo "status=success" >> $GITHUB_OUTPUT
-          elif grep -qiE "out of (host )?capacity|TooManyRequests|InternalError|ServiceUnavailable|\"status\": *5[0-9]{2}|\"status\": *429" result.log; then
+          elif grep -qiE "out of (host )?capacity|TooManyRequests|InternalError|ServiceUnavailable|RequestException|ConnectionError|ConnectTimeout|ReadTimeout|timed out|\"status\": *5[0-9]{2}|\"status\": *429" result.log; then
             echo "status=capacity" >> $GITHUB_OUTPUT
           else
             echo "status=error" >> $GITHUB_OUTPUT
