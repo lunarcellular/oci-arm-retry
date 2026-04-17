@@ -2,12 +2,18 @@ name: Retry ARM VM Creation
 
 on:
   workflow_dispatch:
+    inputs:
+      test_success:
+        description: 'Simulate success (skip real VM launch) — for testing email + self-disable'
+        required: false
+        default: 'false'
 
 jobs:
   retry:
     runs-on: ubuntu-latest
     steps:
       - name: Setup OCI config
+        if: inputs.test_success != 'true'
         run: |
           mkdir -p ~/.oci
           echo "${{ secrets.OCI_PRIVATE_KEY }}" > ~/.oci/oci_api_key.pem
@@ -23,12 +29,14 @@ jobs:
           chmod 600 ~/.oci/config
 
       - name: Install OCI CLI
+        if: inputs.test_success != 'true'
         run: |
           bash -c "$(curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh)" -- --accept-all-defaults --install-dir ~/oci-cli
           echo "$HOME/oci-cli/bin" >> $GITHUB_PATH
 
       - name: Get latest Ubuntu 22.04 ARM image
         id: get-image
+        if: inputs.test_success != 'true'
         run: |
           IMAGE_ID=$(~/oci-cli/bin/oci compute image list \
             --compartment-id "${{ secrets.OCI_COMPARTMENT_ID }}" \
@@ -46,6 +54,13 @@ jobs:
         id: create
         continue-on-error: true
         run: |
+          if [ "${{ inputs.test_success }}" = "true" ]; then
+            echo "TEST MODE — simulating success"
+            echo "status=success" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          set +e
           ~/oci-cli/bin/oci compute instance launch \
             --availability-domain "${{ secrets.OCI_AD }}" \
             --compartment-id "${{ secrets.OCI_COMPARTMENT_ID }}" \
@@ -56,13 +71,20 @@ jobs:
             --display-name "content-pipeline-arm" \
             --ssh-authorized-keys-file /dev/stdin <<< "${{ secrets.OCI_SSH_PUBLIC_KEY }}" \
             --assign-public-ip true \
-            --wait-for-state RUNNING 2>&1 | tee result.log
-          if grep -q "lifecycleState.*RUNNING" result.log; then
+            --wait-for-state RUNNING > result.log 2>&1
+          EXIT_CODE=$?
+          set -e
+
+          cat result.log
+
+          if [ "$EXIT_CODE" = "0" ]; then
+            # OCI CLI exit 0 with --wait-for-state RUNNING means VM actually reached RUNNING
             echo "status=success" >> $GITHUB_OUTPUT
-          elif grep -qi "out of.*capacity\|InternalError\|500\|429" result.log; then
+          elif grep -qiE "out of (host )?capacity|TooManyRequests|InternalError|ServiceUnavailable|\"status\": *5[0-9]{2}|\"status\": *429" result.log; then
             echo "status=capacity" >> $GITHUB_OUTPUT
           else
             echo "status=error" >> $GITHUB_OUTPUT
+            echo "::error::Unexpected failure — see result.log above"
           fi
 
       - name: Send success email
@@ -80,16 +102,35 @@ jobs:
           html_body: |
             <h2>🎉 Oracle Cloud ARM VM is ready!</h2>
             <p>Your ARM VM (4 OCPU / 24 GB RAM) was successfully created.</p>
-            <p>Log into Oracle Cloud to see it. The auto-retry will now stop — you can disable this workflow.</p>
+            <p>Log into Oracle Cloud to see it. The auto-retry will now stop — you can disable your cron-job.org trigger too.</p>
+            ${{ inputs.test_success == 'true' && '<p><em>(This was a TEST run — no VM was actually created.)</em></p>' || '' }}
+
+      - name: Send error alert email
+        if: steps.create.outputs.status == 'error'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.GMAIL_USER }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          subject: "⚠️ ARM VM retry hit unexpected error"
+          to: ${{ secrets.NOTIFICATION_EMAIL }}
+          from: OCI Bot <${{ secrets.GMAIL_USER }}>
+          html_body: |
+            <h2>⚠️ Unexpected error in ARM VM retry</h2>
+            <p>The workflow hit an error that wasn't a capacity issue.</p>
+            <p><a href="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}">View logs</a></p>
 
       - name: Disable workflow on success
         if: steps.create.outputs.status == 'success'
         run: |
-          curl -X PUT \
+          curl -f -X PUT \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             "https://api.github.com/repos/${{ github.repository }}/actions/workflows/retry.yml/disable"
+          echo "Workflow disabled."
 
       - name: Log capacity status
         if: steps.create.outputs.status == 'capacity'
-        run: echo "Still no ARM capacity. Will retry in 30 min."
+        run: echo "Still no ARM capacity. Will retry next tick."
