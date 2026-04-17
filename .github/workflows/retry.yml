@@ -8,6 +8,9 @@ on:
         required: false
         default: 'false'
 
+permissions:
+  actions: write
+
 jobs:
   retry:
     runs-on: ubuntu-latest
